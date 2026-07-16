@@ -25,14 +25,20 @@ class GaitType(Enum):
 
 @dataclass
 class GaitParams:
-    """Parameters defining gait characteristics."""
+    """Parameters defining gait characteristics.
+
+    Defaults match Quadruped-PyMPC trot: duty_factor=0.65, step_freq=1.4 Hz.
+    step_period = 1/step_freq = 0.714s; stance = 0.65*0.714 = 0.464s.
+    """
     # Gait type
     gait_type: GaitType = GaitType.TROT
 
-    # Timing parameters
-    step_period: float = 0.4       # Full gait cycle period [s]
-    stance_duration: float = 0.25  # Stance phase duration [s]
-    swing_duration: float = 0.15   # Swing phase duration [s]
+    # Primary timing control (step_freq is preferred)
+    step_freq: float = 1.4        # Step frequency [Hz] (primary control)
+    step_period: float = None     # Full gait cycle period [s] = 1/step_freq
+    duty_factor: float = 0.65     # Fraction of cycle in stance (stable trot)
+    stance_duration: float = None  # [s], derived if None
+    swing_duration: float = None   # [s], derived if None
 
     # Footstep parameters
     foot_height: float = 0.08      # Maximum foot clearance during swing [m]
@@ -43,17 +49,25 @@ class GaitParams:
     friction: float = 0.7          # Ground friction coefficient
 
     # Contact schedule offsets for each leg
-    # Order: FL(0), FR(1), RL(2), RR(3)
     contact_offsets: Tuple[float, float, float, float] = None
 
     def __post_init__(self):
-        """Initialize default offsets based on gait type."""
+        """Initialize default offsets and derive timing."""
         if self.contact_offsets is None:
             self.contact_offsets = self._default_offsets()
 
-        # Validate timings
-        self.phase_shift = self.stance_duration / self.step_period
-        self.swing_shift = self.swing_duration / self.step_period
+        # Derive step_period from step_freq if not explicitly set
+        if self.step_period is None:
+            self.step_period = 1.0 / self.step_freq
+
+        # Derive stance/swing durations
+        if self.stance_duration is None:
+            self.stance_duration = self.step_period * self.duty_factor
+        if self.swing_duration is None:
+            self.swing_duration = self.step_period * (1.0 - self.duty_factor)
+
+        self.phase_shift = self.duty_factor
+        self.swing_shift = 1.0 - self.duty_factor
 
     def _default_offsets(self) -> Tuple[float, float, float, float]:
         """Get default contact offsets for the gait type."""
@@ -71,7 +85,7 @@ class GaitParams:
             return (0.0, 0.0, 0.0, 0.0)
 
     @property
-    def duty_factor(self) -> float:
+    def duty_factor_prop(self) -> float:
         """Fraction of gait cycle spent in stance."""
         return self.stance_duration / self.step_period
 
@@ -117,63 +131,39 @@ class SwingTrajectoryGenerator:
         ground_height: float = 0.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Generate swing trajectory point.
+        Generate swing trajectory from start_pos to end_pos.
 
-        Uses a modified Bezier curve that accounts for ground height
-        and provides smooth velocity profiles.
+        XY: cubic Bezier interpolation (zero velocity at endpoints)
+        Z:  parabolic arc from start_z, peaking at max(start_z,end_z)+foot_height,
+            landing at end_z.
 
         Args:
-            start_pos: Starting foot position [3]
-            end_pos: Target foot position [3]
+            start_pos: Starting foot position [3] (current foot pos)
+            end_pos: Target foot position [3] (Raibert landing pos)
             phase: Progress through swing [0, 1]
             ground_height: Ground plane height
 
         Returns:
             Tuple of (position, velocity) both [3]
         """
-        # Normalize phase
         phase = np.clip(phase, 0.0, 1.0)
 
-        # Height offset curve - peaks at mid-stance
-        height_phase = 4.0 * phase * (1.0 - phase)  # Parabolic curve
-        height_offset = self.foot_height * height_phase
-
-        # Horizontal interpolation (5th order polynomial for smooth velocity)
+        # XY: cubic Bezier (smooth, zero endpoint velocity)
         h_phase = cubic_bezier(phase)
         pos_xy = start_pos[:2] + h_phase * (end_pos[:2] - start_pos[:2])
-
-        # Z interpolation
-        z_start = ground_height + self.toe_clearance
-        z_end = ground_height + self.toe_clearance
-        z_max = ground_height + self.foot_height
-
-        # Bezier curve for height
-        if phase < 0.5:
-            local_phase = phase * 2.0
-            z = z_start + (z_max - z_start) * cubic_bezier(local_phase)
-        else:
-            local_phase = (phase - 0.5) * 2.0
-            z = z_max - (z_max - z_end) * cubic_bezier(local_phase)
-
-        # Compute velocity analytically (derivative of cubic Bezier)
-        # dh_phase/dphase = derivative of cubic_bezier
-        # cubic_bezier(t) = 3t^2(1-t), derivative = 6t(1-t) - 3t^2 = 6t - 9t^2
-        dh_phase = 6.0 * phase * (1.0 - phase) - 3.0 * phase**2  # = 6*phase - 9*phase**2
-        # For height: h = h_max * 4*t*(1-t), dh/dt = h_max * 4*(1-2t)
-        dh = self.foot_height * 4.0 * (1.0 - 2.0 * phase)
-
+        dh_phase = 6.0 * phase - 6.0 * phase**2
         vel_xy = dh_phase * (end_pos[:2] - start_pos[:2])
 
-        # Z velocity
-        if phase < 0.5:
-            local_phase = phase * 2.0
-            # derivative of cubic_bezier(local_phase) * 2
-            dbez = 6.0 * local_phase * (1.0 - local_phase) - 3.0 * local_phase**2
-            dz = (z_max - z_start) * dbez * 2.0
-        else:
-            local_phase = (phase - 0.5) * 2.0
-            dbez = 6.0 * local_phase * (1.0 - local_phase) - 3.0 * local_phase**2
-            dz = -(z_max - z_end) * dbez * 2.0
+        # Z: arc from start_z -> peak -> end_z
+        z_start = start_pos[2]
+        z_end = end_pos[2]
+        z_peak = max(z_start, z_end, ground_height) + self.foot_height
+
+        z = z_start + (z_end - z_start) * phase + \
+            (z_peak - (z_start + z_end) / 2.0) * 4.0 * phase * (1.0 - phase)
+
+        dz = (z_end - z_start) + \
+             (z_peak - (z_start + z_end) / 2.0) * 4.0 * (1.0 - 2.0 * phase)
 
         pos = np.array([pos_xy[0], pos_xy[1], z])
         vel = np.array([vel_xy[0], vel_xy[1], dz])
@@ -223,19 +213,11 @@ class FootTrajectory:
     """
 
     def __init__(self, gait_params: Optional[GaitParams] = None):
-        """
-        Initialize foot trajectory manager.
-
-        Args:
-            gait_params: Gait parameters
-        """
         self.params = gait_params if gait_params is not None else GaitParams()
         self.swing_gen = SwingTrajectoryGenerator(
             foot_height=self.params.foot_height,
             toe_clearance=self.params.foot_depth
         )
-
-        # Stance phase target (foot desired position during stance)
         self.stance_target = np.zeros(3)
         self.stance_vel = np.zeros(3)
 
@@ -247,29 +229,12 @@ class FootTrajectory:
         foot_pos: np.ndarray,
         com_state: Tuple[np.ndarray, np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get desired foot position and velocity.
-
-        Args:
-            leg_id: Leg index (0-3)
-            phase: Current phase in gait cycle [0, 1]
-            contact_state: Whether foot is in contact
-            foot_pos: Current foot position [3]
-            com_state: (com_pos, com_vel) tuple
-
-        Returns:
-            Tuple of (desired_pos, desired_vel) both [3]
-        """
+        """Get desired foot position and velocity."""
         if contact_state:
-            # In stance: maintain current contact point with velocity
             return self.stance_target.copy(), self.stance_vel.copy()
         else:
-            # In swing: follow swing trajectory
             return self.swing_gen.generate(
-                foot_pos,
-                self.stance_target,
-                phase,
-                self.params.ground_height
+                foot_pos, self.stance_target, phase, self.params.ground_height
             )
 
     def update_stance_target(
@@ -278,14 +243,7 @@ class FootTrajectory:
         desired_pos: np.ndarray,
         desired_vel: Optional[np.ndarray] = None,
     ) -> None:
-        """
-        Update the stance target position for a foot.
-
-        Args:
-            leg_id: Leg index
-            desired_pos: Desired foot position during stance [3]
-            desired_vel: Desired foot velocity during stance [3]
-        """
+        """Update the stance target position for a foot."""
         self.stance_target = desired_pos.copy()
         if desired_vel is not None:
             self.stance_vel = desired_vel.copy()
@@ -300,101 +258,55 @@ class GaitScheduler:
     """
 
     def __init__(self, gait_params: Optional[GaitParams] = None):
-        """
-        Initialize gait scheduler.
-
-        Args:
-            gait_params: Gait parameters
-        """
         self.params = gait_params if gait_params is not None else GaitParams()
         self.leg_count = 4
-        self._phase = 0.0  # Current phase [0, 1]
+        self._phase = 0.0
 
     def reset(self) -> None:
-        """Reset gait phase to zero."""
         self._phase = 0.0
 
     def update(self, dt: float) -> float:
-        """
-        Update gait phase.
-
-        Args:
-            dt: Time step [s]
-
-        Returns:
-            Current phase [0, 1]
-        """
-        self._phase += dt / self.params.step_period
+        """Advance gait phase by dt using step_freq."""
+        self._phase += dt * self.params.step_freq
         self._phase %= 1.0
         return self._phase
 
     def get_contact_schedule(self, phase: Optional[float] = None) -> np.ndarray:
-        """
-        Get contact state for all legs at given phase.
-
-        Args:
-            phase: Gait phase (uses current if None) [0, 1]
-
-        Returns:
-            Contact states [4] as boolean array
-        """
+        """Get contact state for all legs at given phase."""
         if phase is None:
             phase = self._phase
 
         contacts = np.zeros(self.leg_count, dtype=bool)
         for i in range(self.leg_count):
-            # Normalize phase for this leg
             leg_phase = (phase + self.params.contact_offsets[i]) % 1.0
-
-            # In stance if phase is within stance duration
-            contacts[i] = leg_phase < self.params.phase_shift
+            contacts[i] = leg_phase < self.params.duty_factor
 
         return contacts
 
     def get_swing_phase(self, leg_id: int, phase: Optional[float] = None) -> float:
-        """
-        Get swing phase progress for a specific leg.
-
-        Args:
-            leg_id: Leg index
-            phase: Gait phase
-
-        Returns:
-            Swing phase [0, 1] if in swing, -1 if in stance
-        """
+        """Get swing phase progress for a specific leg. Returns -1 if in stance."""
         if phase is None:
             phase = self._phase
 
         contact = self.get_contact_schedule(phase)
-
         if contact[leg_id]:
-            return -1.0  # In stance
+            return -1.0
 
-        # Compute swing phase
         leg_phase = (phase + self.params.contact_offsets[leg_id]) % 1.0
-        return leg_phase / self.params.phase_shift
+        swing_duration = 1.0 - self.params.duty_factor
+        return (leg_phase - self.params.duty_factor) / swing_duration
 
     def get_stance_phase(self, leg_id: int, phase: Optional[float] = None) -> float:
-        """
-        Get stance phase progress for a specific leg.
-
-        Args:
-            leg_id: Leg index
-            phase: Gait phase
-
-        Returns:
-            Stance phase [0, 1] if in stance, -1 if in swing
-        """
+        """Get stance phase progress for a specific leg. Returns -1 if in swing."""
         if phase is None:
             phase = self._phase
 
         contact = self.get_contact_schedule(phase)
-
         if not contact[leg_id]:
-            return -1.0  # In swing
+            return -1.0
 
         leg_phase = (phase + self.params.contact_offsets[leg_id]) % 1.0
-        return leg_phase / self.params.phase_shift
+        return leg_phase / self.params.duty_factor
 
 
 class GaitGenerator:
@@ -406,12 +318,6 @@ class GaitGenerator:
     """
 
     def __init__(self, gait_params: Optional[GaitParams] = None):
-        """
-        Initialize gait generator.
-
-        Args:
-            gait_params: Gait parameters
-        """
         self.params = gait_params if gait_params is not None else GaitParams()
         self.scheduler = GaitScheduler(self.params)
         self.trajectory = FootTrajectory(self.params)
@@ -426,27 +332,16 @@ class GaitGenerator:
         self._foot_velocities = np.zeros((4, 3))
 
     def reset(self) -> None:
-        """Reset gait generator to initial state."""
         self.scheduler.reset()
         self._phase = 0.0
+        self._contact_states = np.zeros(4, dtype=bool)
 
     def step(self, dt: float) -> None:
-        """
-        Advance gait by one time step.
-
-        Args:
-            dt: Time step [s]
-        """
+        """Advance gait by one time step."""
         self._phase = self.scheduler.update(dt)
         self._contact_states = self.scheduler.get_contact_schedule()
 
     def update_foot_positions(self, foot_positions: np.ndarray) -> None:
-        """
-        Update current foot positions from sensor data.
-
-        Args:
-            foot_positions: Current foot positions [4, 3]
-        """
         self._foot_positions = foot_positions.copy()
 
     def compute_desired_foot_state(
@@ -455,37 +350,97 @@ class GaitGenerator:
         base_vel: np.ndarray,
         com_acc: Optional[np.ndarray] = None,
         foot_positions: Optional[np.ndarray] = None,
+        command: Optional[np.ndarray] = None,
+        base_pos: Optional[np.ndarray] = None,
+        base_rpy: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Compute desired foot states for all legs.
+        Compute desired foot states for all legs using Raibert heuristic.
 
-        Uses current foot positions as reference, with simple
-        Raibert-like velocity compensation for swing legs.
-
-        Args:
-            com_state: (com_pos, com_vel) tuple
-            base_vel: Base linear velocity in world frame [3]
-            com_acc: Optional CoM acceleration [3]
-            foot_positions: Current foot positions [4,3]
-
-        Returns:
-            Tuple of (foot_pos_desired [4,3], foot_vel_desired [4,3], contacts [4])
+        p_foot_des_xy = p_hip_xy + v_cmd * T_stance / 2 + k_raibert * (v_actual - v_cmd)
         """
         com_pos, com_vel = com_state
         foot_pos_des = np.zeros((4, 3))
         foot_vel_des = np.zeros((4, 3))
 
-        # Default standing foot offset (simple - use actual foot positions)
+        # Hip positions in base frame
+        hip_offsets = np.array([
+            [ 0.25944,  0.075113, 0.0],   # FL
+            [ 0.25944, -0.075113, 0.0],   # FR
+            [-0.25944,  0.075113, 0.0],   # RL
+            [-0.25944, -0.075113, 0.0],   # RR
+        ])
+
+        # Default foot offsets from hip in standing pose (base frame)
+        default_foot_offsets = np.array([
+            [ 0.0,  0.13, -0.35],   # FL
+            [ 0.0, -0.13, -0.35],   # FR
+            [ 0.0,  0.13, -0.35],   # RL
+            [ 0.0, -0.13, -0.35],   # RR
+        ])
+
+        T_stance = self.params.stance_duration
+        k_raibert = 0.03   # mild feedback for velocity correction
+
+        if command is None:
+            cmd_vx, cmd_vy = 0.0, 0.0
+        else:
+            cmd_vx, cmd_vy = command[0], command[1]
+
+        actual_vx = base_vel[0]
+        actual_vy = base_vel[1]
+
+        # Raibert in body frame
+        # Raibert offset: place foot ahead by half stance travel + feedback velocity correction
+        raibert_body_x = cmd_vx * T_stance / 2.0 + k_raibert * (actual_vx - cmd_vx)
+        raibert_body_y = cmd_vy * T_stance / 2.0 + k_raibert * (actual_vy - cmd_vy)
+
+        # Kinematic safety clipping: prevent target from exceeding leg workspace limit (max 0.15m)
+        raibert_norm = np.sqrt(raibert_body_x**2 + raibert_body_y**2)
+        max_raibert = 0.15
+        if raibert_norm > max_raibert:
+            scale = max_raibert / raibert_norm
+            raibert_body_x *= scale
+            raibert_body_y *= scale
+
+        # body->world rotation
+        if base_rpy is not None:
+            roll, pitch, yaw = base_rpy
+            cr, sr = np.cos(roll), np.sin(roll)
+            cp, sp = np.cos(pitch), np.sin(pitch)
+            cy, sy = np.cos(yaw), np.sin(yaw)
+            R_body_to_world = np.array([
+                [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+                [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+                [-sp,   cp*sr,            cp*cr],
+            ])
+        else:
+            R_body_to_world = np.eye(3)
+
+        if base_pos is None:
+            base_pos = com_pos
+
+        raibert_body = np.array([raibert_body_x, raibert_body_y, 0.0])
+        raibert_world = R_body_to_world @ raibert_body
+
         for i in range(4):
-            if foot_positions is not None:
-                # Use current foot position as desired (stance)
-                foot_pos_des[i] = foot_positions[i].copy()
-            else:
-                # Fallback: fixed foot position below hip
-                foot_pos_des[i] = com_pos + np.array([0.2 if i < 2 else -0.2,
-                                                       0.08 if i % 2 == 0 else -0.08,
-                                                       -0.35])
-            foot_vel_des[i] = np.zeros(3)
+            hip_world = base_pos + R_body_to_world @ hip_offsets[i]
+            default_foot_world = base_pos + R_body_to_world @ (hip_offsets[i] + default_foot_offsets[i])
+
+            foot_pos_des[i, 0] = default_foot_world[0] + raibert_world[0]
+            foot_pos_des[i, 1] = default_foot_world[1] + raibert_world[1]
+            foot_pos_des[i, 2] = self.params.ground_height + 0.005
+
+            # Blend current pos for stance legs to avoid jumps
+            if self._contact_states[i] and foot_positions is not None:
+                foot_pos_des[i, 0] = 0.9 * foot_positions[i, 0] + 0.1 * foot_pos_des[i, 0]
+                foot_pos_des[i, 1] = 0.9 * foot_positions[i, 1] + 0.1 * foot_pos_des[i, 1]
+                foot_pos_des[i, 2] = foot_positions[i, 2]
+
+            if not self._contact_states[i]:
+                foot_vel_des[i, 0] = cmd_vx
+                foot_vel_des[i, 1] = cmd_vy
+            foot_vel_des[i, 2] = 0.0
 
         return foot_pos_des, foot_vel_des, self._contact_states
 
@@ -496,46 +451,27 @@ class GaitGenerator:
         start_pos: np.ndarray,
         end_pos: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get swing trajectory for specific leg.
-
-        Args:
-            leg_id: Leg index
-            phase: Swing phase [0, 1]
-            start_pos: Swing start position
-            end_pos: Swing end position
-
-        Returns:
-            Tuple of (position, velocity)
-        """
+        """Get swing trajectory for specific leg."""
         return self.swing_gen.generate(
-            start_pos,
-            end_pos,
-            phase,
-            self.params.ground_height
+            start_pos, end_pos, phase, self.params.ground_height
         )
 
     @property
     def phase(self) -> float:
-        """Current gait phase [0, 1]."""
         return self._phase
 
     @property
     def contact_states(self) -> np.ndarray:
-        """Current contact states for all legs."""
         return self._contact_states
 
     @property
     def has_flight_phase(self) -> bool:
-        """Whether current gait has a flight phase."""
         return self.params.flight_factor > 0
 
     @property
     def stance_time(self) -> float:
-        """Duration of stance phase [s]."""
         return self.params.step_period * self.params.duty_factor
 
     @property
     def swing_time(self) -> float:
-        """Duration of swing phase [s]."""
         return self.params.step_period * (1.0 - self.params.duty_factor)

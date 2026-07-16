@@ -23,7 +23,7 @@ def cubic_bezier(t: float) -> float:
         Interpolated value [0, 1]
     """
     t = np.clip(t, 0.0, 1.0)
-    return 3.0 * t * t * (1.0 - t)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def smooth_step(t: float) -> float:

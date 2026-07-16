@@ -56,6 +56,8 @@ class QuadrupedController:
             params=mpc_params if mpc_params else MPCParams()
         )
         self.wbc = WBCController(
+            model=self.robot.mj_model,
+            data=self.robot.mj_data,
             params=wbc_params if wbc_params else WBCParams(),
         )
         self.gait = GaitGenerator(
@@ -65,6 +67,9 @@ class QuadrupedController:
         # State tracking
         self._step_count = 0
         self._last_time = 0.0
+        self._swing_start_pos = np.zeros((4, 3))
+        self._last_contact_states = np.ones(4, dtype=bool)
+        self._stance_target_pos = self.robot.get_foot_positions()
 
         # Data logging
         self.logger = DataLogger()
@@ -87,120 +92,174 @@ class QuadrupedController:
         """
         Main control update.
 
+        Pipeline:
+          1. State estimation (from MuJoCo)
+          2. Gait scheduler + Raibert foot placement
+          3. Swing trajectory generation (Bezier)
+          4. MPC: height + velocity-tracking forces with friction cone
+          5. Joint PD + gravity compensation + force feedforward + yaw stabilisation
+
         Args:
             dt: Time step [s]
 
         Returns:
             Joint torques [12]
         """
-        # 1. Get robot state
+        # ── 1. Get robot state ────────────────────────────────────
         state = self.robot.update_state()
+        com_pos = state.base_pos.copy()
+        rpy = self.robot.get_rpy()
 
-        # 2. Update gait (skip if standing still)
-        cmd_speed = np.linalg.norm(self._command)
+        # A2Robot returns velocities in BODY frame (it already applies R^T).
+        # We need WORLD-frame velocities for MPC (velocity tracking uses world
+        # commands) and BODY-frame for Raibert (Raibert is body-centric).
+        R_body_to_world = self._rpy_to_rot(rpy)
+
+        # Linear: body → world (MPC uses world frame for velocity tracking)
+        com_vel_body = state.base_lin_vel.copy()    # body frame from A2Robot
+        com_vel = R_body_to_world @ com_vel_body    # → world frame
+
+        # Angular: body → world  (A2Robot already converted to body, so R is needed)
+        ang_vel_body = state.base_ang_vel.copy()    # body frame from A2Robot
+        ang_vel = R_body_to_world @ ang_vel_body    # → world frame
+
+        foot_positions = self.robot.get_foot_positions()
+        foot_velocities = self.robot.get_foot_velocities()
+
+        # ── 2. Update gait ────────────────────────────────────────
+        cmd_speed = np.linalg.norm(self._command[:2])
         is_standing = cmd_speed < 0.01
 
         if not is_standing:
             self.gait.step(dt)
-            self.gait.update_foot_positions(self.robot.get_foot_positions())
+            self.gait.update_foot_positions(foot_positions)
 
-        # 3. Compute CoM state
-        com_pos = state.base_pos.copy()
-        com_vel = state.base_lin_vel.copy()
-        rpy = self.robot.get_rpy()
-        ang_vel = state.base_ang_vel.copy()
-
-        # 4. Compute desired foot positions (Raibert heuristic)
+        # ── 3. Compute desired foot positions (Raibert) ───────────
         com_state = (com_pos, com_vel)
-        foot_positions = self.robot.get_foot_positions()
-        foot_velocities = self.robot.get_foot_velocities()
 
         if is_standing:
-            # All legs stay in stance, no swing
             contact_states = np.ones(4, dtype=bool)
-            self.gait._contact_states = contact_states  # sync for debug display
-            foot_des_pos = foot_positions.copy()
+            self.gait._contact_states = contact_states
+            foot_des_pos = self._stance_target_pos.copy()
             foot_des_vel = np.zeros((4, 3))
         else:
             foot_des_pos, foot_des_vel, contact_states = \
                 self.gait.compute_desired_foot_state(
                     com_state,
-                    state.base_lin_vel,
+                    com_vel_body,  # BODY-frame velocity for Raibert (cmd is body-frame)
+                    foot_positions=foot_positions,
+                    command=self._command,
+                    base_pos=com_pos,
+                    base_rpy=rpy,
                 )
 
-            # 5. Update swing foot trajectories
+            # ── 4. Swing trajectory (Bezier interpolation) ────────
             for i in range(4):
                 if not contact_states[i]:
+                    # Detect liftoff: transitioned from stance to swing
+                    if self._last_contact_states[i]:
+                        self._swing_start_pos[i] = foot_positions[i].copy()
+                    
                     swing_phase = self.gait.scheduler.get_swing_phase(i)
                     if swing_phase >= 0:
-                        start = foot_positions[i]
+                        start = self._swing_start_pos[i]
                         end = foot_des_pos[i]
                         pos, vel = self.gait.get_swing_trajectory(
                             i, swing_phase, start, end
                         )
                         foot_des_pos[i] = pos
                         foot_des_vel[i] = vel
+                else:
+                    # Stance leg: lock touchdown position to avoid kinematics drift
+                    # Detect touchdown: transitioned from swing to stance
+                    if self._last_contact_states[i] == False: # transitioned from swing
+                        self._stance_target_pos[i] = foot_des_pos[i].copy()
+                    foot_des_pos[i] = self._stance_target_pos[i].copy()
+                    foot_des_vel[i] = np.zeros(3)
 
-        # 6. Update MPC reference
-        com_des = com_pos.copy()
-        com_des[0] += self._command[0] * 0.5  # Simple lookahead
-        com_des[1] += self._command[1] * 0.5
-        com_des[2] = 0.47  # Target height for A2
-
-        self.mpc.set_reference(com_des)
-
-        # 7. Solve MPC (simple force distribution)
+        # ── 5. MPC: compute reference contact forces ──────────────
+        # MPC outputs desired contact forces F_mpc for velocity tracking
+        # and height control.  These are fed directly to WBC as J^T*F_mpc
+        # feedforward for stance legs.
+        # State: [com_pos(3), com_vel(3), rpy(3), ang_vel(3)] = [12]
         foot_pos_rel = foot_positions - com_pos[:, None].T
+        centroidal_state = np.concatenate([com_pos, com_vel, rpy, ang_vel])
+
         mpc_forces, _ = self.mpc.solve(
-            np.concatenate([com_pos, com_vel, rpy, ang_vel]),
+            centroidal_state,
             foot_pos_rel,
             contact_states,
+            com_vel=com_vel,
+            cmd_vel=self._command,
+            rpy=rpy,
+            ang_vel=ang_vel,
         )
-        self._last_mpc_forces = mpc_forces.copy()  # 保存用于调试
+        self._last_mpc_forces = mpc_forces.copy()
+        self._last_mpc_debug = getattr(self.mpc, '_last_debug', {})
 
-        # 8. WBC → q_des, v_des, T_des → PD
-        # WBC computes per-leg targets from MPC + gait
-        q_des = np.zeros(12)
-        v_des = np.zeros(12)
-        T_des = np.zeros(12)
-
-        # Gravity bias (G_j from mj_rne)
-        G_j = self._compute_gravity_bias()
-
+        # Compute joint-space targets for all legs using IK
+        joint_pos_des = np.zeros(12)
         for i in range(4):
-            s = i * 3
-            if contact_states[i]:
-                # Stance: standing pose + MPC force feedforward
-                q_des[s:s+3] = self.robot.stand_joint_pos[s:s+3]
-                v_des[s:s+3] = 0.0
-                # T_des = G_j - Jc^T * f_mpc (from floating-base EOM: h = Sᵀτ + Jᵀf)
-                Jj = self._foot_jacobian(i)[:, s:s+3]  # [3,3] for this leg only
-                T_des[s:s+3] = G_j[s:s+3] - Jj.T @ mpc_forces[i]
-            else:
-                # Swing: IK foot→joint + gravity bias (no contact force)
-                q_swing = self._solve_leg_ik(i, foot_des_pos[i])
-                q_des[s:s+3] = q_swing
-                v_des[s:s+3] = 0.0
-                T_des[s:s+3] = G_j[s:s+3]  # gravity compensation, no contact force
+            joint_pos_des[i*3:i*3+3] = self._solve_leg_ik(i, foot_des_pos[i])
+            if not contact_states[i] and self._step_count % 100 == 0:
+                leg_names = ['FL', 'FR', 'RL', 'RR']
+                s = i * 3
+                print(f"[DEBUG SWING] Leg {leg_names[i]}:")
+                print(f"  foot_des: {foot_des_pos[i]}")
+                print(f"  foot_cur: {foot_positions[i]}")
+                print(f"  q_des   : {joint_pos_des[s:s+3]}")
+                print(f"  q_cur   : {state.joint_pos[s:s+3]}")
 
-        # PD: tau = kp*(q_des - q) + kd*(v_des - v) + T_des
-        kp_j, kd_j = 400.0, 12.0
-        torques = kp_j * (q_des - state.joint_pos) + kd_j * (v_des - state.joint_vel) + T_des
-        torques = np.clip(torques, -120, 120)
+        # ── 6. WBC: QP-based whole-body control ──────────────────
+        # Decision variables: x = [qdd (18), tau (12), Fc (3·n_contacts)]
+        #   Cost: COM tracking + orientation + swing foot + force ref + τ reg
+        #   Eq:   M·qdd + h = Sᵀ·tau + Jcᵀ·Fc  (dynamics)
+        #         Jc·qdd = 0                     (stance no-slip)
+        #   Ineq: friction cone, torque limits
+        if is_standing:
+            com_ref = np.array([0.0, 0.0, 0.43])
+        else:
+            com_ref = np.array([com_pos[0], com_pos[1], 0.43])  # desired CoM height
+        torques, wbc_info = self.wbc.compute_joint_torques(
+            com_pos=com_pos,
+            com_vel=com_vel,
+            com_rpy=rpy,
+            com_ang_vel=ang_vel,
+            foot_positions=foot_positions,
+            foot_velocities=foot_velocities,
+            foot_desired_positions=foot_des_pos,
+            foot_desired_velocities=foot_des_vel,
+            contact_states=contact_states,
+            joint_positions=state.joint_pos,
+            joint_velocities=state.joint_vel,
+            mpc_forces=mpc_forces,
+            com_ref=com_ref,
+            joint_pos_des=joint_pos_des,
+            is_walking=not is_standing,
+        )
+
+        # Yaw stabilisation is handled by WBC (orientation PD) and MPC (yaw force).
+        # No extra yaw torque is added here to avoid triple-stacking.
+
+        # ── 7. Store for debug ────────────────────────────────────
         self._last_torques = torques.copy()
-        self._last_q_des = q_des.copy()
+        self._last_wbc_info = wbc_info
+        self._last_foot_des_pos = foot_des_pos.copy()
+        self._last_foot_pos = foot_positions.copy()
+        self._last_contact_states = contact_states.copy()
+        self._last_com_vel = com_vel.copy()
+        self._last_rpy = rpy.copy()
 
-        info = {'Td_max': float(np.max(np.abs(T_des))),
-                'q_err_max': float(np.max(np.abs(q_des - state.joint_pos)))}
-        self._last_info = info
-
-        # 11. Log data
+        # ── 9. Log data ───────────────────────────────────────────
         self.logger.log(
             self._last_time,
             step=self._step_count,
             com_pos=com_pos,
             com_vel=com_vel,
+            rpy=rpy,
+            ang_vel=ang_vel,
             contact_states=contact_states,
+            foot_pos=foot_positions,
             foot_des_pos=foot_des_pos,
             mpc_forces=mpc_forces,
             joint_torques=torques,
@@ -261,8 +320,8 @@ class QuadrupedController:
         print(f"Command: vx={self._command[0]:.2f}, vy={self._command[1]:.2f}, yaw={self._command[2]:.2f}")
         if debug:
             print(f"[DEBUG] Mode: ON | Interval: every {debug_interval} steps")
-            print(f"[DEBUG] Controller: joint PD + gravity bias (mj_rne)")
-            print(f"[DEBUG] MPC: height_target=0.48, friction={self.mpc.params.friction_coeff:.2f}")
+            print(f"[DEBUG] Controller: PD joints + Raibert foot placement + MPC force FF + yaw stab")
+            print(f"[DEBUG] MPC: height PD + velocity-tracking horizontal force + friction cone (μ={self.mpc.params.friction_coeff:.2f})")
             print(f"[DEBUG] Gait: period={self.gait.params.step_period:.2f}s, "
                   f"stance={self.gait.params.stance_duration:.2f}s, "
                   f"swing={self.gait.params.swing_duration:.2f}s")
@@ -288,19 +347,37 @@ class QuadrupedController:
                 sys.stdout.flush()
 
             # Print progress
-            if step % 1000 == 0:
+            if step % 500 == 0:
                 elapsed = time.time() - start_time
-                print(f"  Step {step}/{n_steps} | "
-                      f"CoM: ({self.robot.state.base_pos[0]:.2f}, "
-                      f"{self.robot.state.base_pos[1]:.2f}, "
-                      f"{self.robot.state.base_pos[2]:.2f}) | "
-                      f"FPS: {step/max(elapsed,1e-6):.0f}", flush=True)
+                state = self.robot.state
+                v = state.base_lin_vel
+                rpy = self.robot.get_rpy()
+                cmd = self._command
+                ev = cmd[0] - v[0]
+                print(f"  Step {step:5d}/{n_steps} | "
+                      f"CoM: ({state.base_pos[0]:.2f}, {state.base_pos[1]:.2f}, {state.base_pos[2]:.3f}) | "
+                      f"Vbody:({v[0]:.3f},{v[1]:.3f}) cmd=({cmd[0]:.2f},{cmd[1]:.2f}) | "
+                      f"Yaw:{rpy[2]*180/np.pi:+.1f}° | "
+                      f"FPS:{step/max(elapsed,1e-6):.0f}", flush=True)
 
             # Detailed debug output
             if debug and step % debug_interval == 0 and step > 0:
                 self._print_debug_info(step, dt)
 
         print("Simulation complete", flush=True)
+
+    @staticmethod
+    def _rpy_to_rot(rpy: np.ndarray) -> np.ndarray:
+        """Convert roll-pitch-yaw [rad] → rotation matrix (body→world)."""
+        r, p, y = rpy
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        return np.array([
+            [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+            [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+            [-sp,   cp*sr,            cp*cr],
+        ])
 
     def _compute_gravity_bias(self) -> np.ndarray:
         """Use MuJoCo inverse dynamics to compute joint torques needed
@@ -329,7 +406,7 @@ class QuadrupedController:
         return tau_full[6:18].copy()  # joint part only
 
     def _solve_leg_ik(self, leg_id: int, foot_target_world: np.ndarray) -> np.ndarray:
-        """Quick IK for one leg: Newton step using MuJoCo numerical Jacobian.
+        """Numerical IK for one leg with convergence loop (Newton-Raphson).
 
         Args:
             leg_id: 0=FL, 1=FR, 2=RL, 3=RR
@@ -338,27 +415,40 @@ class QuadrupedController:
             joint angles [3] for this leg
         """
         s = leg_id * 3
-        q0 = self.robot.state.joint_pos[s:s+3].copy()
-        leg_names = ['FL', 'FR', 'RL', 'RR']
-        body_id = self.robot.mj_model.body(self.robot.FOOT_BODY_NAMES[leg_names[leg_id]]).id
-        foot_current = self.robot.mj_data.xpos[body_id].copy()
-
-        # Newton step: Δq = pinv(J) * (p_des - p_cur)
-        J = self._foot_jacobian(leg_id)[:, s:s+3]  # [3,3] for this leg
-        err = foot_target_world - foot_current
-        try:
-            JTJ = J.T @ J + np.eye(3) * 0.01
-            dq = np.linalg.solve(JTJ, J.T @ err)
-        except np.linalg.LinAlgError:
-            dq = np.zeros(3)
-
-        q_new = q0 + dq
-        # Clip to joint limits
         limits = [(-1.01, 1.01), (-2.34, 3.15), (-2.77, -0.54)]
-        return np.clip(q_new, [l[0] for l in limits], [l[1] for l in limits])
+        q_min = np.array([l[0] for l in limits])
+        q_max = np.array([l[1] for l in limits])
+
+        # Backup current state of this leg to restore later
+        q_backup = self.robot.mj_data.qpos[7+s : 7+s+3].copy()
+
+        q_sol = q_backup.copy()
+        for _ in range(5):
+            self.robot.mj_data.qpos[7+s : 7+s+3] = q_sol
+            mujoco.mj_forward(self.robot.mj_model, self.robot.mj_data)
+
+            foot_current = self.robot.get_foot_positions()[leg_id]
+            err = foot_target_world - foot_current
+            if np.linalg.norm(err) < 1e-4:
+                break
+
+            J = self._foot_jacobian(leg_id)[:, s:s+3]
+            try:
+                JTJ = J.T @ J + np.eye(3) * 0.001
+                dq = np.linalg.solve(JTJ, J.T @ err)
+            except np.linalg.LinAlgError:
+                break
+
+            q_sol = np.clip(q_sol + dq, q_min, q_max)
+
+        # Restore state
+        self.robot.mj_data.qpos[7+s : 7+s+3] = q_backup
+        mujoco.mj_forward(self.robot.mj_model, self.robot.mj_data)
+
+        return q_sol
 
     def _foot_jacobian(self, leg_id: int) -> np.ndarray:
-        """Compute 3×12 foot Jacobian using MuJoCo numerical Jacobian.
+        """Compute corrected 3×12 contact-point foot Jacobian.
 
         Args:
             leg_id: 0=FL, 1=FR, 2=RL, 3=RR
@@ -370,91 +460,202 @@ class QuadrupedController:
         body_name = self.robot.FOOT_BODY_NAMES[leg_names[leg_id]]
         body_id = self.robot.mj_model.body(body_name).id
 
-        jac_full = np.zeros((3, self.robot.mj_model.nv))
+        J_body = np.zeros((3, self.robot.mj_model.nv))
+        J_rot  = np.zeros((3, self.robot.mj_model.nv))
         mujoco.mj_jacBody(
             self.robot.mj_model, self.robot.mj_data,
-            jac_full, None, body_id
+            J_body, J_rot, body_id
         )
+
+        r_body   = np.array([0.0, 0.0, -0.275])
+        xmat     = self.robot.mj_data.xmat[body_id].reshape(3, 3)
+        r_world  = xmat @ r_body
+        rx,ry,rz = r_world
+        skew_r   = np.array([[0,-rz,ry],[rz,0,-rx],[-ry,rx,0]])
+
+        J_full = J_body - skew_r @ J_rot
         # Return joint part (columns 6:18, skipping 6 floating-base DOFs)
-        return jac_full[:, 6:18].copy()
+        return J_full[:, 6:18].copy()
 
     def save_data(self, path: str) -> None:
         """Save logged data."""
         self.logger.save(path)
 
     def _print_debug_info(self, step: int, dt: float) -> None:
-        """Print detailed debug information."""
+        """Print comprehensive debug information for root-cause analysis."""
         state = self.robot.state
-        print(f"\n[DEBUG] === Step {step} (t={step*dt:.2f}s) ===")
-        print(f"[DEBUG] CoM  pos : ({state.base_pos[0]:.3f}, {state.base_pos[1]:.3f}, {state.base_pos[2]:.3f})")
-        print(f"[DEBUG] CoM  vel : ({state.base_lin_vel[0]:.3f}, {state.base_lin_vel[1]:.3f}, {state.base_lin_vel[2]:.3f})")
         rpy = self.robot.get_rpy()
-        print(f"[DEBUG] RPY      : roll={rpy[0]*180/np.pi:.1f}° pitch={rpy[1]*180/np.pi:.1f}° yaw={rpy[2]*180/np.pi:.1f}°")
-        print(f"[DEBUG] Ang vel  : ({state.base_ang_vel[0]:.3f}, {state.base_ang_vel[1]:.3f}, {state.base_ang_vel[2]:.3f})")
-
-        # Joint states
-        print(f"[DEBUG] Joint pos: {np.array2string(state.joint_pos, precision=3)}")
-        print(f"[DEBUG] Joint vel: {np.array2string(state.joint_vel, precision=3)}")
-
-        # Contact states
-        contact_names = ['FL', 'FR', 'RL', 'RR']
-        contact_str = ' '.join(f"{n}:{int(self.gait.contact_states[i])}" for i, n in enumerate(contact_names))
-        print(f"[DEBUG] Contacts  : {contact_str}")
-
-        # Gait phase
-        print(f"[DEBUG] Gait phase: {self.gait.phase:.3f}")
-
-        # Foot positions
         foot_names = ['FL', 'FR', 'RL', 'RR']
+        contact_names = ['FL', 'FR', 'RL', 'RR']
+
+        print(f"\n{'='*70}")
+        print(f"[DEBUG] Step {step} (t={step*dt:.2f}s) | Gait phase={self.gait.phase:.3f}")
+        print(f"{'='*70}")
+
+        # ═══════════════════════════════════════════════════════════
+        # 1. STATE — CoM position, velocity, orientation
+        # ═══════════════════════════════════════════════════════════
+        print(f"[STATE] CoM pos  : ({state.base_pos[0]:.4f}, {state.base_pos[1]:.4f}, {state.base_pos[2]:.4f}) m")
+        v_body = state.base_lin_vel
+        v_cmd = self._command
+        evx_body = v_cmd[0] - v_body[0]
+        evy_body = v_cmd[1] - v_body[1]
+        print(f"[STATE] CoM vel (body): ({v_body[0]:.4f}, {v_body[1]:.4f}, {v_body[2]:.4f}) m/s  |  "
+              f"CMD:(vx={v_cmd[0]:.2f},vy={v_cmd[1]:.2f})  "
+              f"Δv_body=({evx_body:+.3f},{evy_body:+.3f})  "
+              f"|v|={np.linalg.norm(v_body[:2]):.3f}/{np.linalg.norm(v_cmd[:2]):.3f} m/s")
+        v_world = getattr(self, '_last_com_vel', v_body)
+        print(f"[STATE] CoM vel (world):({v_world[0]:.4f}, {v_world[1]:.4f}, {v_world[2]:.4f}) m/s")
+        print(f"[STATE] RPY      : roll={rpy[0]*180/np.pi:+.2f}°  pitch={rpy[1]*180/np.pi:+.2f}°  yaw={rpy[2]*180/np.pi:+.2f}°")
+        ang = state.base_ang_vel
+        print(f"[STATE] Ang vel  : ({ang[0]:.4f}, {ang[1]:.4f}, {ang[2]:.4f}) rad/s")
+
+        # ═══════════════════════════════════════════════════════════
+        # 2. GAIT — Contact schedule & foot placement
+        # ═══════════════════════════════════════════════════════════
+        contact_str = ' '.join(
+            f"{n}:{'STANCE' if self.gait.contact_states[i] else 'SWING '}"
+            for i, n in enumerate(contact_names))
+        print(f"[GAIT] Contacts  : {contact_str}")
+
+        fp = self.robot.get_foot_positions()
+        fdp = getattr(self, '_last_foot_des_pos', fp)
         for i, name in enumerate(foot_names):
-            fp = self.robot.get_foot_positions()[i]
-            print(f"[DEBUG] Foot {name} pos: ({fp[0]:.3f}, {fp[1]:.3f}, {fp[2]:.3f})")
+            is_swing = not self.gait.contact_states[i]
+            tag = "🦶" if not is_swing else "✈️ "
+            f_cur = fp[i]
+            f_des = fdp[i] if fdp is not None else f_cur
+            err_xy = np.linalg.norm(f_des[:2] - f_cur[:2])
+            err_z = f_des[2] - f_cur[2]
+            if is_swing:
+                print(f"[GAIT] {tag} {name}: cur=({f_cur[0]:.4f},{f_cur[1]:.4f},{f_cur[2]:.4f})  "
+                      f"des=({f_des[0]:.4f},{f_des[1]:.4f},{f_des[2]:.4f})  "
+                      f"err_xy={err_xy:.4f} err_z={err_z:+.4f}")
+            else:
+                print(f"[GAIT] {tag} {name}: cur=({f_cur[0]:.4f},{f_cur[1]:.4f},{f_cur[2]:.4f})  "
+                      f"Fz_des={self._last_mpc_forces[i,2]:.1f}N")
 
-        # MPC forces (from log)
-        if hasattr(self.logger, '_buffer') and 'mpc_forces' in self.logger._buffer:
-            last_forces = self.logger._buffer['mpc_forces']
-            if last_forces is not None and last_forces.size > 0:
-                print(f"[DEBUG] MPC forces shape: {last_forces.shape}, ndim: {last_forces.ndim}")
-                # Handle both array and scalar cases
-                if last_forces.ndim == 2 and last_forces.shape[0] == 4 and last_forces.shape[1] == 3:
-                    print(f"[DEBUG] MPC forces:")
-                    for i, name in enumerate(foot_names):
-                        f = last_forces[i]
-                        print(f"[DEBUG]   {name}: ({f[0]:.1f}, {f[1]:.1f}, {f[2]:.1f}) N")
-                elif last_forces.ndim == 1 and last_forces.size == 4:
-                    # Old format: [fz_FL, fz_FR, fz_RL, fz_RR]
-                    print(f"[DEBUG] MPC forces (Fz only): "
-                          f"FL={last_forces[0]:.1f}, FR={last_forces[1]:.1f}, "
-                          f"RL={last_forces[2]:.1f}, RR={last_forces[3]:.1f} N")
-                elif last_forces.ndim == 1 and last_forces.size == 12:
-                    # Flattened [f0x,f0y,f0z,f1x,f1y,f1z,...]
-                    print(f"[DEBUG] MPC forces (flattened):")
-                    for i, name in enumerate(foot_names):
-                        idx = i * 3
-                        print(f"[DEBUG]   {name}: ({last_forces[idx]:.1f}, {last_forces[idx+1]:.1f}, {last_forces[idx+2]:.1f}) N")
-                else:
-                    print(f"[DEBUG] MPC forces: {last_forces}")
-
-        # Torques
-        if hasattr(self, '_last_torques'):
-            t = self._last_torques
-            print(f"[DEBUG] Torques   : {np.array2string(t, precision=2)}")
-            print(f"[DEBUG] Torque max: {np.max(np.abs(t)):.2f} Nm")
-
-        # MPC force vs weight check
-        mpc_total_fz = 0.0
-        for i in range(4):
-            if self.gait.contact_states[i]:
-                if hasattr(self, '_last_mpc_forces'):
-                    mpc_total_fz += self._last_mpc_forces[i, 2]
+        # ═══════════════════════════════════════════════════════════
+        # 3. MPC — Forces (horizontal + vertical) & friction check
+        # ═══════════════════════════════════════════════════════════
+        print(f"[MPC] ── Diagnostic Forces (world frame, NOT fed to WBC) ──")
+        mpc_f = self._last_mpc_forces
+        total_f = np.zeros(3)
+        total_fz = 0.0
+        for i, name in enumerate(foot_names):
+            f = mpc_f[i]
+            fh_norm = np.linalg.norm(f[:2])
+            fz = f[2]
+            mu_used = fh_norm / max(fz, 1e-6)
+            contact = self.gait.contact_states[i]
+            if contact:
+                total_f += f
+                total_fz += fz
+                mu_flag = " ⚠️SLIP" if mu_used > 0.7 else ""
+            else:
+                mu_flag = ""
+            tag = "STANCE" if contact else "SWING "
+            print(f"[MPC]   {name} [{tag}]: fx={f[0]:+7.1f} fy={f[1]:+7.1f} fz={f[2]:+7.1f} N  "
+                  f"|fh|={fh_norm:.1f} μ={mu_used:.3f}{mu_flag}")
         robot_weight = self.mpc.dynamics.mass * 9.81
         n_stance = int(self.gait.contact_states.sum())
-        print(f"[DEBUG] MPC total Fz: {mpc_total_fz:.1f} N | Robot weight: {robot_weight:.1f} N | Stance legs: {n_stance}")
+        print(f"[MPC]   Total: Σfx={total_f[0]:+.1f} Σfy={total_f[1]:+.1f} Σfz={total_fz:.1f} N  "
+              f"vs weight={robot_weight:.1f} N  stance_legs={n_stance}")
+        # MPC internal debug
+        mpc_dbg = getattr(self, '_last_mpc_debug', {})
+        if mpc_dbg:
+            print(f"[MPC]   Internal: height_err={mpc_dbg.get('height_err',0):+.4f}m  "
+                  f"fx_total={mpc_dbg.get('fx_total',0):+.1f}N  "
+                  f"fy_total={mpc_dbg.get('fy_total',0):+.1f}N  "
+                  f"evx_body={mpc_dbg.get('evx_body',0):+.3f} evy_body={mpc_dbg.get('evy_body',0):+.3f}  "
+                  f"v_body=({mpc_dbg.get('vx_body',0):.3f},{mpc_dbg.get('vy_body',0):.3f})  "
+                  f"yaw_tau={mpc_dbg.get('tau_yaw',0):+.2f}Nm")
 
-        # Controller info
-        if hasattr(self, '_last_info'):
-            _info = self._last_info
-            print(f"[DEBUG] Control   : bias={_info.get('bias_max',0):.0f} Nm, torque_max={_info.get('torque_max',0):.0f} Nm")
+        # ═══════════════════════════════════════════════════════════
+        # 4. CONTROL — Joint positions, torques, yaw stabilisation
+        # ═══════════════════════════════════════════════════════════
+        print(f"[CTRL] Joint pos : {np.array2string(state.joint_pos, precision=3, suppress_small=True)}")
+        t = self._last_torques
+        print(f"[CTRL] Torques   : {np.array2string(t, precision=1, suppress_small=True)}")
+        print(f"[CTRL] Torque max: {np.max(np.abs(t)):.1f} Nm  |  "
+              f"limit: hip=±120 thigh=±120 calf=±180")
+        wbc_info = getattr(self, '_last_wbc_info', {})
+        if wbc_info:
+            print(f"[CTRL] WBC: |tau|={wbc_info.get('tau_norm',0):.0f}Nm  "
+                  f"|g|={wbc_info.get('tau_g_norm',0):.0f}  "
+                  f"|ff|={wbc_info.get('tau_ff_norm',0):.0f}  "
+                  f"|ori|={wbc_info.get('tau_ori_norm',0):.0f}  "
+                  f"|sw|={wbc_info.get('tau_swing_norm',0):.0f}")
+
+        # ═══════════════════════════════════════════════════════════
+        # 5. FORCE CHAIN — F→a→v→p diagnostics
+        # ═══════════════════════════════════════════════════════════
+        print(f"[CHAIN] ── F→a→v→p diagnostic chain ──")
+        m = self.mpc.dynamics.mass  # 40.071 kg
+        g_vec = np.array([0.0, 0.0, -9.81])
+
+        # ── F: MPC planned forces ─────────────────────────────────
+        f_mpc = getattr(self, '_last_mpc_forces', np.zeros((4,3)))
+        total_f_mpc = np.sum(f_mpc, axis=0)
+        print(f"[CHAIN]   F_mpc (Σ): ({total_f_mpc[0]:+.1f}, {total_f_mpc[1]:+.1f}, {total_f_mpc[2]:+.1f}) N")
+
+        # ── a_exp: expected COM accel from F_mpc ──────────────────
+        a_exp = total_f_mpc / m + g_vec
+        print(f"[CHAIN]   a_exp = ΣF/m + g = ({a_exp[0]:+.3f}, {a_exp[1]:+.3f}, {a_exp[2]:+.3f}) m/s²")
+
+        # ── a_act: actual COM accel (finite diff) ──────────────────
+        v_now = getattr(self, '_last_com_vel', np.zeros(3))
+        v_prev = getattr(self, '_prev_com_vel', v_now.copy())
+        a_act = (v_now - v_prev) / dt
+        self._prev_com_vel = v_now.copy()
+        print(f"[CHAIN]   a_act (fdiff)   = ({a_act[0]:+.3f}, {a_act[1]:+.3f}, {a_act[2]:+.3f}) m/s²")
+        print(f"[CHAIN]   a_err = a_exp-a_act = ({a_exp[0]-a_act[0]:+.3f}, {a_exp[1]-a_act[1]:+.3f}, {a_exp[2]-a_act[2]:+.3f}) m/s²")
+
+        # ── v: velocity tracking ──────────────────────────────────
+        v_body = state.base_lin_vel
+        v_world = v_now
+        v_cmd_body = np.array([self._command[0], self._command[1], 0.0])
+        print(f"[CHAIN]   v_act(body) = ({v_body[0]:+.4f}, {v_body[1]:+.4f}, {v_body[2]:+.4f}) m/s")
+        print(f"[CHAIN]   v_act(world)= ({v_world[0]:+.4f}, {v_world[1]:+.4f}, {v_world[2]:+.4f}) m/s")
+        print(f"[CHAIN]   v_cmd(body) = ({v_cmd_body[0]:+.2f}, {v_cmd_body[1]:+.2f}, {v_cmd_body[2]:+.2f}) m/s")
+
+        # ── p: position tracking ──────────────────────────────────
+        print(f"[CHAIN]   p_act = ({state.base_pos[0]:+.4f}, {state.base_pos[1]:+.4f}, {state.base_pos[2]:+.4f}) m")
+        print(f"[CHAIN]   p_des_z = 0.470 m")
+
+        # ── WBC torque decomposition ──────────────────────────────
+        wbc_info = getattr(self, '_last_wbc_info', {})
+        if wbc_info:
+            print(f"[CHAIN]   τ: |base|={wbc_info.get('tau_base_norm',0):.1f} "
+                  f"|tot|={wbc_info.get('tau_norm',0):.1f} Nm  "
+                  f"a_des_z={wbc_info.get('a_des_z',0):+.1f} dz={wbc_info.get('dz',0):+.3f}")
+
+        # ═══════════════════════════════════════════════════════════
+        # 6. SUMMARY — Key metrics for triage
+        # ═══════════════════════════════════════════════════════════
+        print(f"[SUMMARY] ─────────────────────────────────────────")
+        evx_body = v_cmd[0] - v_body[0]
+        evy_body = v_cmd[1] - v_body[1]
+        issues = []
+        if abs(evx_body) > 0.08:
+            issues.append(f"VX_body err {evx_body:+.3f} m/s")
+        if abs(evy_body) > 0.08:
+            issues.append(f"VY_body err {evy_body:+.3f} m/s")
+        if abs(rpy[2]) > 0.08:
+            issues.append(f"Yaw drift {rpy[2]*180/np.pi:+.1f}°")
+        if abs(ang[2]) > 0.15:
+            issues.append(f"Yaw rate {ang[2]:+.3f} rad/s")
+        if abs(0.47 - state.base_pos[2]) > 0.03:
+            issues.append(f"Height err {state.base_pos[2]-0.47:+.3f}m")
+        if abs(rpy[0]) > 0.10:
+            issues.append(f"Roll {rpy[0]*180/np.pi:+.1f}°")
+        if abs(rpy[1]) > 0.10:
+            issues.append(f"Pitch {rpy[1]*180/np.pi:+.1f}°")
+
+        if issues:
+            print(f"[SUMMARY] ⚠️  Issues: {' | '.join(issues)}")
+        else:
+            print(f"[SUMMARY] ✅ All metrics nominal")
 
 
 def main():

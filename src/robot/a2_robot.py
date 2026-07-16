@@ -72,7 +72,8 @@ class A2RobotParams:
 
     @property
     def total_mass(self) -> float:
-        return self.base_mass + 4 * (self.hip_mass + self.thigh_mass + self.calf_mass)
+        # base_mass (19.651 kg) from XML is already the total mass of the robot.
+        return self.base_mass
 
     @property
     def standing_base_z(self) -> float:
@@ -207,8 +208,9 @@ class A2Robot:
         self.state.base_quat = self.mj_data.xquat[body_id].copy()
 
         # Base velocities (world frame)
-        lin_vel_world = self.mj_data.cvel[body_id][:3].copy()
-        ang_vel_world = self.mj_data.cvel[body_id][3:].copy()
+        # cvel has [angular, linear] in world orientation
+        lin_vel_world = self.mj_data.cvel[body_id][3:].copy()
+        ang_vel_world = self.mj_data.cvel[body_id][:3].copy()
 
         # Transform to body frame
         R = self._quat_to_rot(self.state.base_quat)
@@ -231,14 +233,27 @@ class A2Robot:
         """Get foot positions [4, 3] in world frame."""
         positions = np.zeros((4, 3))
         for i, (leg, body_id) in enumerate(self.foot_body_ids.items()):
-            positions[i] = self.mj_data.xpos[body_id].copy()
+            # Foot tip is at pos=[0 0 -0.275] in local frame of calf body
+            r_body = np.array([0.0, 0.0, -0.275])
+            xpos = self.mj_data.xpos[body_id]
+            xmat = self.mj_data.xmat[body_id].reshape(3, 3)
+            positions[i] = xpos + xmat @ r_body
         return positions
 
     def get_foot_velocities(self) -> np.ndarray:
         """Get foot velocities [4, 3] in world frame."""
         velocities = np.zeros((4, 3))
         for i, (leg, body_id) in enumerate(self.foot_body_ids.items()):
-            velocities[i] = self.mj_data.cvel[body_id][:3].copy()
+            r_body = np.array([0.0, 0.0, -0.275])
+            xmat = self.mj_data.xmat[body_id].reshape(3, 3)
+            r_world = xmat @ r_body
+            
+            # cvel has [angular, linear] in world orientation
+            omega = self.mj_data.cvel[body_id][:3]
+            v_com = self.mj_data.cvel[body_id][3:]
+            
+            # rigid-body velocity propagation: v_tip = v_com + omega x r
+            velocities[i] = v_com + np.cross(omega, r_world)
         return velocities
 
     def set_joint_torque(self, torques: np.ndarray) -> None:
@@ -265,12 +280,12 @@ class A2Robot:
 
     @staticmethod
     def _quat_to_rot(quat: np.ndarray) -> np.ndarray:
-        """Quaternion to rotation matrix."""
+        """Convert quaternion [w, x, y, z] to body->world rotation matrix."""
         w, x, y, z = quat
         return np.array([
-            [1-2*y*y-2*z*z, 2*x*y+2*z*w, 2*x*z-2*y*w],
-            [2*x*y-2*z*w, 1-2*x*x-2*z*z, 2*y*z+2*x*w],
-            [2*x*z+2*y*w, 2*y*z-2*x*w, 1-2*x*x-2*y*y]
+            [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
+            [    2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z,     2*y*z - 2*x*w],
+            [    2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y]
         ])
 
     @property

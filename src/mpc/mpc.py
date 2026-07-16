@@ -45,7 +45,7 @@ class MPCParams:
 
     # ── A2 physical parameters ──────────────────────────
     base_mass: float = 19.651            # kg  (base_link only)
-    total_mass: float = 40.071          # kg  (full robot incl. legs)
+    total_mass: float = 40.071           # kg  (matching actual simulated model mass)
     inertia: np.ndarray = None          # [3,3] base inertia
 
     # CoM dynamics weights
@@ -64,11 +64,15 @@ class MPCParams:
     foot_pos_weight: float = 0.01
 
     # Friction coefficient
-    friction_coeff: float = 0.7
+    friction_coeff: float = 0.5   # matches Quadruped-PyMPC
 
     # Normal force limits [N]
     min_normal_force: float = 20.0
-    max_normal_force: float = 300.0
+    max_normal_force: float = 250.0  # reduced: 2-leg stance = 196N, allow 27% margin
+
+    # Force scale multiplier. 1.3 gives a bit more margin for yaw
+    # correction within the friction cone.
+    force_scale: float = 1.0   # must not push through contacts   # hybrid Jacobian + IK-based PD
 
     # State/action noise for robustness (sim2real)
     state_noise_std: float = 0.01
@@ -79,13 +83,19 @@ class MPCParams:
     warm_start: bool = True
     max_iterations: int = 50
 
-    # CoM height constraint
+    min_com_height: float = 0.25
+    max_com_height: float = 0.45
     min_com_height: float = 0.25
     max_com_height: float = 0.45
 
     def __post_init__(self):
         if self.inertia is None:
             self.inertia = np.diag([0.472398, 0.407723, 0.141627])
+        # Sanity check: total_mass should equal base_mass (centroidal model
+        # uses base-only mass; leg dynamics are handled by WBC separately).
+        # total_mass ≠ base_mass is expected: centroidal model uses base mass,
+        # while weight support calculates per-leg from total mass including legs.
+        # This is intentional — no warning needed.
 
     @property
     def horizon_time(self) -> float:
@@ -112,8 +122,9 @@ class CentroidalDynamics:
             mass: Total robot mass [kg]  (A2 base = 19.651 kg, full = 40.071 kg)
             inertia: Base inertia tensor [3, 3]
         """
-        # A2: total mass ≈ 40.071 kg (centroidal dynamics uses full robot mass)
-        self.mass = mass if mass is not None else 40.071
+        # Centroidal model uses BASE mass only (leg dynamics handled by WBC)
+        # A2 base_link = 19.651 kg; full robot = 40.071 kg (used by WBC)
+        self.mass = mass if mass is not None else 19.651
         # A2 base diaginertia = [0.472398, 0.407723, 0.141627]
         self.inertia = inertia if inertia is not None else np.diag([0.472398, 0.407723, 0.141627])
 
@@ -245,18 +256,14 @@ class CentroidalDynamics:
         # Compute angular acceleration
         ang_acc = np.linalg.solve(self.inertia, total_moment)
 
-        # Update velocity
+        # Update velocity (linear + angular)
         com_vel_new = com_vel + dt * total_force / self.mass
+        ang_vel_new = ang_vel + dt * ang_acc
 
-        # Update position
+        # Update position (linear + angular)
         com_pos_new = com_pos + dt * com_vel_new
 
-        # Update orientation (simplified)
-        R = np.array([
-            [1, -ang_vel[2] * dt, ang_vel[1] * dt],
-            [ang_vel[2] * dt, 1, -ang_vel[0] * dt],
-            [-ang_vel[1] * dt, ang_vel[0] * dt, 1]
-        ])
+        # Update orientation (simplified Euler integration)
         euler_new = euler + dt * ang_vel
 
         return np.concatenate([com_pos_new, com_vel_new, euler_new, ang_vel_new])
@@ -372,7 +379,7 @@ class MPCController:
         """
         self.params = params if params is not None else MPCParams()
         self.dynamics = dynamics if dynamics is not None else CentroidalDynamics(
-            mass=self.params.total_mass,
+            mass=self.params.total_mass,      # centroidal model uses total mass
             inertia=self.params.inertia,
         )
         self.friction = FrictionCone(self.params.friction_coeff)
@@ -444,18 +451,29 @@ class MPCController:
         foot_positions: np.ndarray,
         contact_states: np.ndarray,
         initial_guess: Optional[np.ndarray] = None,
+        com_vel: Optional[np.ndarray] = None,
+        cmd_vel: Optional[np.ndarray] = None,
+        rpy: Optional[np.ndarray] = None,
+        ang_vel: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Solve the MPC problem using a simplified height controller.
+        Solve the MPC problem: vertical force (height + weight) + horizontal
+        force (velocity tracking) with friction-cone clipping.
 
-        For simplicity, uses uniform force distribution with MPC-style
-        height feedback.
+        The force distribution follows:
+          1. Vertical:  uniform weight support + height PD feedback
+          2. Horizontal: PD on velocity error, clipped to friction cone
+          3. Yaw:        small differential x-forces on left/right legs to damp rotation
 
         Args:
-            state: Current centroidal state [12]
+            state: Current centroidal state [12] = [com_pos, com_vel, euler, ang_vel]
             foot_positions: Current foot positions relative to CoM [4, 3]
             contact_states: Contact states [4]
             initial_guess: Optional initial force guess [4, 3]
+            com_vel: Actual CoM velocity in world frame [3] (if not in state)
+            cmd_vel: Command velocity [vx, vy, yaw_rate] in world frame
+            rpy: Current roll-pitch-yaw [3]
+            ang_vel: Current angular velocity [3]
 
         Returns:
             Tuple of (optimal_foot_forces [4,3], optimal_foot_positions [4,3])
@@ -465,30 +483,147 @@ class MPCController:
         if n_contacts == 0:
             return np.zeros((4, 3)), foot_positions.copy()
 
-        # Current CoM height
+        # ── Vertical force (height + weight compensation) ─────────
         com_height = state[2]
-
-        # Target height
-        target_height = 0.48  # IK standing height at H=0.467
-
-        # Height error
+        target_height = 0.43  # CoM target height
         height_error = target_height - com_height
+        com_vel_z = state[5] if len(state) > 5 else 0.0
 
-        # Distribute weight with height compensation
-        total_weight = self.dynamics.mass * 9.81
+        # Weight support uses TOTAL robot mass (centroidal model carries whole robot)
+        total_weight = self.params.total_mass * 9.81
         per_leg = total_weight / n_contacts
 
-        # Add height-based adjustment
-        kp_height = 500.0  # Height control gain (increased for numerical Jacobian)
-        force_adj = kp_height * height_error / n_contacts
+        # Height PD: Fz = mg + kp*(h_des-h) + kd*(0 - v_z)
+        # With kp=200, kd=10, at height_error=0.12m and v_z=5m/s:
+        #   fz_extra = (200*0.12 + 10*5)/n = (24+50)/n = 37N per leg (n=2) — safe.
+        # Original kd=30 gave (24+150)/n = 87N which caused bounce/oscillation.
+        kp_height = 200.0
+        kd_height = 10.0
+        fz_extra = (kp_height * height_error + kd_height * (0.0 - com_vel_z)) / n_contacts
+        # Clamp height correction to ±30% of weight per leg to prevent oscillation
+        fz_extra = np.clip(fz_extra, -per_leg * 0.3, per_leg * 0.3)
 
+        # ── Horizontal force (velocity tracking in BODY frame) ───
+        # Commands (vx,vy) are interpreted in the robot's body frame.
+        # We use MODERATE gains since Raibert foot placement is the primary
+        # propulsion mechanism. Horizontal forces primarily correct small errors.
+        mu = self.params.friction_coeff  # 0.7
+
+        # Velocity tracking — mild correction to supplement Raibert.
+        # Gains kept very low (15/5) to avoid oscillation.
+        kp_vx = 100.0
+        kp_vy = 100.0
+
+        # Command velocity (body-frame interpretation)
+        if cmd_vel is not None:
+            cmd_vx_body, cmd_vy_body = cmd_vel[0], cmd_vel[1]
+        else:
+            cmd_vx_body, cmd_vy_body = 0.0, 0.0
+
+        # Build body→world rotation for velocity transform
+        if rpy is not None:
+            r, p, y = rpy
+            cy, sy = np.cos(y), np.sin(y)
+            R_yaw = np.array([[cy, -sy], [sy, cy]])  # 2D yaw rotation
+        else:
+            R_yaw = np.eye(2)
+
+        # Actual velocity: convert world→body using yaw rotation
+        if com_vel is not None:
+            v_world_xy = com_vel[:2]
+            v_body_xy = R_yaw.T @ v_world_xy  # world→body (inverse of R_yaw)
+            actual_vx_body, actual_vy_body = v_body_xy[0], v_body_xy[1]
+        else:
+            actual_vx_body, actual_vy_body = 0.0, 0.0
+
+        # Velocity error in body frame
+        evx_body = cmd_vx_body - actual_vx_body
+        evy_body = cmd_vy_body - actual_vy_body
+
+        # Desired horizontal force in BODY frame (P-only, no D-damping)
+        # D-term removed: -kd*v caused steady-state error (v_eq < v_cmd)
+        fx_body_total = kp_vx * evx_body
+        fy_body_total = kp_vy * evy_body
+
+        # ── Yaw stabilization ────────────────────────────────────
+        kp_yaw = 300.0   # Nm per rad — high to fight friction cone
+        kd_yaw = 40.0    # Nm per rad/s
+
+        if rpy is not None and ang_vel is not None:
+            yaw_err = 0.0 - rpy[2]
+            yaw_rate_err = 0.0 - ang_vel[2]
+            tau_yaw_des = kp_yaw * yaw_err + kd_yaw * yaw_rate_err
+            tau_yaw_des = np.clip(tau_yaw_des, -80.0, 80.0)
+        else:
+            tau_yaw_des = 0.0
+
+        # Compute body-frame foot positions and y_sq_sum_body
+        if rpy is not None:
+            r, p, y = rpy
+            cr, sr = np.cos(r), np.sin(r)
+            cp, sp = np.cos(p), np.sin(p)
+            cy, sy = np.cos(y), np.sin(y)
+            R = np.array([
+                [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+                [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+                [-sp,   cp*sr,            cp*cr],
+            ])
+        else:
+            R = np.eye(3)
+
+        foot_pos_body = (R.T @ foot_positions.T).T
+        y_sq_sum_body = sum(foot_pos_body[j, 1]**2 for j in range(4) if contact_states[j]) + 1e-6
+
+        # ── Assemble forces with friction-cone clipping ──────────
         forces = np.zeros((4, 3))
+        mu_effective = mu  # friction coefficient
+
         for i in range(4):
             if contact_states[i]:
-                fz = per_leg + force_adj
-                # Clip to limits
+                # Vertical force (world frame)
+                fz = per_leg + fz_extra
                 fz = np.clip(fz, self.params.min_normal_force, self.params.max_normal_force)
-                forces[i] = np.array([0.0, 0.0, fz])
+
+                # Horizontal forces in body frame
+                fx_body = fx_body_total / n_contacts
+                fy_body = fy_body_total / n_contacts
+
+                # Yaw torque contribution (body frame)
+                yi_body = foot_pos_body[i, 1]
+                fx_yaw_body = -tau_yaw_des * yi_body / y_sq_sum_body
+                fx_body += fx_yaw_body
+
+                # Rotate horizontal forces to world frame
+                f_world_xy = R_yaw @ np.array([fx_body, fy_body])
+                fx = f_world_xy[0]
+                fy = f_world_xy[1]
+
+                # Friction cone clipping: sqrt(fx² + fy²) <= mu * fz
+                f_h_norm = np.sqrt(fx**2 + fy**2)
+                f_h_max = mu_effective * fz
+                if f_h_norm > f_h_max and f_h_norm > 1e-6:
+                    scale = f_h_max / f_h_norm
+                    fx *= scale
+                    fy *= scale
+
+                forces[i] = np.array([fx, fy, fz])
+
+        # Friction cone clipping (same as before)
+        self._last_debug = {
+            'height_err': height_error,
+            'fz_total': n_contacts * (per_leg + fz_extra),
+            'weight': total_weight,
+            'fx_total': fx_body_total,
+            'fy_total': fy_body_total,
+            'evx_body': evx_body,
+            'evy_body': evy_body,
+            'vx_body': actual_vx_body,
+            'vy_body': actual_vy_body,
+            'tau_yaw': tau_yaw_des,
+        }
+
+        # Scale forces to compensate for MuJoCo contact gap (1.0 = no scaling)
+        forces *= self.params.force_scale  # force_scale=1.0 → no-op
 
         return forces, foot_positions.copy()
 
