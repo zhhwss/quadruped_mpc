@@ -485,7 +485,7 @@ class MPCController:
 
         # ── Vertical force (height + weight compensation) ─────────
         com_height = state[2]
-        target_height = 0.43  # CoM target height
+        target_height = 0.467  # CoM target height (matching actual standing pose from IK)
         height_error = target_height - com_height
         com_vel_z = state[5] if len(state) > 5 else 0.0
 
@@ -545,17 +545,11 @@ class MPCController:
         fx_body_total = kp_vx * evx_body
         fy_body_total = kp_vy * evy_body
 
-        # ── Yaw stabilization ────────────────────────────────────
-        kp_yaw = 300.0   # Nm per rad — high to fight friction cone
-        kd_yaw = 40.0    # Nm per rad/s
-
-        if rpy is not None and ang_vel is not None:
-            yaw_err = 0.0 - rpy[2]
-            yaw_rate_err = 0.0 - ang_vel[2]
-            tau_yaw_des = kp_yaw * yaw_err + kd_yaw * yaw_rate_err
-            tau_yaw_des = np.clip(tau_yaw_des, -80.0, 80.0)
-        else:
-            tau_yaw_des = 0.0
+        # ── Yaw stabilization disabled - causes long-term drift
+        # Yaw control through differential Fx creates continuous torque,
+        # which causes angular acceleration and持续 rotation.
+        # For standing, yaw drift is acceptable (affects position, not balance).
+        tau_yaw_des = 0.0
 
         # Compute body-frame foot positions and y_sq_sum_body
         if rpy is not None:

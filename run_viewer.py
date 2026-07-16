@@ -18,7 +18,15 @@ if __name__ == '__main__':
     args = p.parse_args()
 
     ctrl = QuadrupedController('models/a2_scene.xml')
-    ctrl.set_command(args.vx, 0.0, 0.0)
+
+    # Set command based on gait type
+    if args.gait == 'stand':
+        # Stand gait: zero velocity command
+        ctrl.set_command(0.0, 0.0, 0.0)
+    else:
+        # Locomotion gait: use vx command
+        ctrl.set_command(args.vx, 0.0, 0.0)
+
     print(f"Gait: {args.gait} | cmd: vx={args.vx}")
     print("Controls: ↑↓←→ adjust velocity, Ctrl=stop, close window=quit\n")
     ctrl.run_simulation(duration=args.duration, render=True, debug=False)

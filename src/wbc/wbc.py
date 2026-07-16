@@ -144,9 +144,9 @@ class WBCController:
                     tau_joint_pd[s+2] = 50.0 * q_err[2] + 4.0 * dq_err[2]
                 else:
                     # Strong joint PD during standing to resist collapse
-                    tau_joint_pd[s]   = 10.0 * q_err[0] + 2.0 * dq_err[0]
-                    tau_joint_pd[s+1] = 10.0 * q_err[1] + 2.0 * dq_err[1]
-                    tau_joint_pd[s+2] = 80.0 * q_err[2] + 4.0 * dq_err[2]
+                    tau_joint_pd[s]   = 50.0 * q_err[0] + 5.0 * dq_err[0]
+                    tau_joint_pd[s+1] = 50.0 * q_err[1] + 5.0 * dq_err[1]
+                    tau_joint_pd[s+2] = 150.0 * q_err[2] + 8.0 * dq_err[2]
             else:
                 # Swing legs: no extra joint-space damping needed (tau_swing already has damping)
                 tau_joint_pd[s]   = 0.0
@@ -230,34 +230,36 @@ class WBCController:
                 tau_ori += -Ji_joints.T @ f_vec
 
         # Pitch: differential Fz front/rear
-        # Positive pitch -> nose down -> front legs (x_sign=1) must push harder (Fz_corr > 0)
-        # Due to the negative sign in the pitch torque relation (tau_y = -x * Fz),
-        # we need fz_pitch to be positive to get restoring torque.
+        # tau_pitch = sum(-x * Fz) where x is front-positive in body frame
+        # To stabilize pitch:
+        #   - nose down (pitch > 0): need negative torque (nose up)
+        #     -> increase front leg force, decrease rear leg force
+        #   - nose up (pitch < 0): need positive torque (nose down)
+        #     -> decrease front leg force, increase rear leg force
         fz_pitch = self.p.ori_pitch_kp * pitch + self.p.ori_pitch_kd * wy
+        # Clamp pitch correction to ±20% of per-leg force to prevent instability
+        fz_pitch = np.clip(fz_pitch, -per_leg * 0.2, per_leg * 0.2) if 'per_leg' in dir() else np.clip(fz_pitch, -50.0, 50.0)
         for i in range(4):
             if contact_states[i]:
                 Ji = self._compute_foot_jacobian(i)
                 Ji_joints = Ji[:, 6:]
+                # Front legs (FL, FR) are at indices 0, 1; Rear legs (RL, RR) are at indices 2, 3
+                # x_sign = 1 for front legs (need more Fz when pitch down)
+                # x_sign = -1 for rear legs (need less Fz when pitch down)
                 x_sign = 1.0 if i in (0, 1) else -1.0
+                # Apply pitch correction as differential force
+                # fz_pitch > 0 means front legs should push harder
                 f_vec = np.array([0.0, 0.0, x_sign * fz_pitch / n_stance])
                 tau_ori += -Ji_joints.T @ f_vec
 
-        # Yaw: differential Fx left/right
-        # Positive yaw -> rotated left -> left legs (y > 0) must push forward (Fx_corr > 0)
-        # to generate restoring torque (tau_z = -y * Fx < 0).
-        fx_yaw = self.p.ori_yaw_kp * yaw + self.p.ori_yaw_kd * wz
-        if foot_positions is not None:
-            y_sq_sum = sum(foot_positions[i, 1]**2 for i in range(4)
-                          if contact_states[i]) + 1e-6
-        else:
-            y_sq_sum = 1e-6
+        # Yaw control disabled - handled by MPC to avoid conflict and instability
+        # The MPC already provides yaw stabilization through differential Fx forces
+        fx_yaw = 0.0
         for i in range(4):
             if contact_states[i]:
                 Ji = self._compute_foot_jacobian(i)
                 Ji_joints = Ji[:, 6:]
-                y_val = foot_positions[i, 1] if foot_positions is not None else 0.0
-                # Force correction Fx = fx_yaw * y / sum(y^2)
-                f_vec = np.array([fx_yaw * y_val / y_sq_sum, 0.0, 0.0])
+                f_vec = np.array([0.0, 0.0, 0.0])  # No yaw correction in WBC
                 tau_ori += -Ji_joints.T @ f_vec
 
         if self._step_count % 100 == 0:
